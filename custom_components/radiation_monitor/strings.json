@@ -1,0 +1,33 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Radiation Monitor Setup",
+        "description": "Set up a radiation monitoring station from the REMAP JRC network.\n\nVisit {url} to find your local station code.",
+        "data": {
+          "station_code": "Station Code (e.g., EE20395)",
+          "station_name": "Station Name (e.g., Radiation Tallinn)",
+          "scan_interval": "Update interval in seconds (minimum 300)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to the API. Please check your internet connection and try again.",
+      "invalid_station_code": "Station code appears to be invalid. Please check the code and try again."
+    },
+    "abort": {
+      "already_configured": "This station is already configured"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Radiation Monitor Options",
+        "description": "Adjust the update interval for radiation data",
+        "data": {
+          "scan_interval": "Update interval in seconds (minimum 300)"
+        }
+      }
+    }
+  }
+}

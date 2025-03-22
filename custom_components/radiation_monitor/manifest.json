@@ -1,0 +1,12 @@
+{
+  "domain": "radiation_monitor",
+  "name": "Radiation Monitor",
+  "codeowners": ["@zaifkhan"],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/zaifkhan/radiation_monitor",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/zaifkhan/radiation_monitor/issues",
+  "requirements": [],
+  "version": "1.0.0"
+}

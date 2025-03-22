@@ -1,0 +1,18 @@
+# Service definitions for Radiation Monitor integration
+
+update_radiation_data:
+  name: Update Radiation Data
+  description: Force an immediate update of radiation data for the specified entity.
+  target:
+    entity:
+      domain: sensor
+      integration: radiation_monitor
+  fields:
+    entity_id:
+      name: Entity
+      description: The radiation sensor entity to update.
+      required: true
+      selector:
+        entity:
+          domain: sensor
+          integration: radiation_monitor
