@@ -109,63 +109,133 @@ class RadiationUpdateCoordinator(DataUpdateCoordinator):
     
     async def _async_update_data(self):
         """Fetch data from API endpoint."""
-        try:
-            # Get current time and 24 hours ago in UTC
-            now_utc = datetime.utcnow()
-            start_utc = now_utc - timedelta(hours=24)
-            
-            # Format timestamps for API call
-            now_utc_str = now_utc.strftime("%Y%m%d%H%M%S")
-            start_utc_str = start_utc.strftime("%Y%m%d%H%M%S")
-            
-            # Build URL
-            url = f"https://remap.jrc.ec.europa.eu/api/timeseries/v1/stations/timeseries/{start_utc_str}/{now_utc_str}?codes={self.station_code}"
-            
-            # Prepare headers with our stamp
-            headers = {"stamp": str(self.stamp)}
-            
-            # Fetch data
-            import aiohttp
-            async with aiohttp.ClientSession() as session:
-                try:
-                    async with session.get(url, headers=headers, timeout=30) as response:
-                        if response.status != 200:
-                            _LOGGER.warning(f"API returned status {response.status} for station {self.station_name} ({self.station_code})")
-                            # Return last known good data if available
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                # Get current time and 72 hours ago in UTC
+                now_utc = datetime.utcnow()
+                start_utc = now_utc - timedelta(hours=72)  # Extended to 3 days
+                
+                # Format timestamps for API call
+                now_utc_str = now_utc.strftime("%Y%m%d%H%M%S")
+                start_utc_str = start_utc.strftime("%Y%m%d%H%M%S")
+                
+                # Build URL
+                url = f"https://remap.jrc.ec.europa.eu/api/timeseries/v1/stations/timeseries/{start_utc_str}/{now_utc_str}?codes={self.station_code}"
+                
+                # Prepare headers with our stamp
+                headers = {"stamp": str(self.stamp)}
+                
+                # Fetch data
+                import aiohttp
+                async with aiohttp.ClientSession() as session:
+                    try:
+                        async with session.get(url, headers=headers, timeout=30) as response:
+                            # Log raw response for debugging
+                            response_text = await response.text()
+                            _LOGGER.debug(f"Raw response text (first 500 chars): {response_text[:500]}")
+                            
+                            if response.status != 200:
+                                _LOGGER.warning(f"API returned status {response.status} for station {self.station_name} ({self.station_code})")
+                                # Return last known good data if available
+                                if self.data:
+                                    return self.data
+                                raise UpdateFailed(f"Error fetching data: {response.status}")
+                            
+                            # Parse the response as JSON
+                            try:
+                                # We already have the response text, so parse it directly
+                                import json
+                                try:
+                                    data = json.loads(response_text)
+                                except json.JSONDecodeError:
+                                    # Try again with explicit encoding
+                                    _LOGGER.debug("Trying alternative encoding for JSON parsing")
+                                    try:
+                                        # Try Latin-1 encoding which is more permissive
+                                        content_bytes = response_text.encode('utf-8')
+                                        data = json.loads(content_bytes.decode('latin-1'))
+                                    except Exception as enc_err:
+                                        _LOGGER.error(f"Failed encoding attempt: {enc_err}")
+                                        raise
+                            except Exception as json_err:
+                                _LOGGER.error(f"Error parsing JSON response: {json_err}")
+                                if self.data:
+                                    return self.data
+                                raise UpdateFailed(f"Error parsing response: {json_err}")
+                            
+                            # Debug the returned data
+                            if data and len(data) >= 2:
+                                _LOGGER.debug(f"Received data: {data[:2]}")  # Log first 2 items to avoid log spam
+                            elif data:
+                                _LOGGER.debug(f"Received data: {data}")  # Log all items if fewer than 2
+                            
+                            if not data or len(data) == 0:
+                                _LOGGER.warning(f"No data returned from API for station {self.station_name} ({self.station_code})")
+                                # Return last known good data if available
+                                if self.data:
+                                    return self.data
+                                
+                                # Instead of raising an error, return a default value
+                                return {
+                                    "value": 0,
+                                    "raw_value": 0,
+                                    "timestamp": datetime.utcnow().isoformat(),
+                                    "station_code": self.station_code,
+                                    "returned_code": "unknown",
+                                    "stamp": self.stamp,
+                                    "divisor": self.divisor,
+                                    "status": "No data available"
+                                }
+                            
+                            # Extract the last value - don't check station code since it might be encoded differently
+                            last_entry = data[-1]
+                            
+                            # Safely access properties
+                            try:
+                                last_value = last_entry["value"]
+                                scaled_value = round(last_value / self.divisor, 3)
+                                
+                                return {
+                                    "value": scaled_value,
+                                    "raw_value": last_value,
+                                    "timestamp": last_entry.get("date", datetime.utcnow().isoformat()),
+                                    "station_code": self.station_code,  # Use our stored station code
+                                    "returned_code": last_entry.get("code", "unknown"),  # Store the returned code for debugging
+                                    "stamp": self.stamp,
+                                    "divisor": self.divisor,
+                                }
+                            except KeyError as key_err:
+                                _LOGGER.error(f"Missing required key in data: {key_err}")
+                                if self.data:
+                                    return self.data
+                                raise UpdateFailed(f"Invalid data format: {key_err}")
+                                
+                    except aiohttp.ClientError as client_err:
+                        _LOGGER.error(f"Client error for {self.station_name}: {client_err}")
+                        # Try again if we have retries left
+                        retry_count += 1
+                        if retry_count >= max_retries:
                             if self.data:
                                 return self.data
-                            raise UpdateFailed(f"Error fetching data: {response.status}")
-                        
-                        data = await response.json()
-                        
-                        if not data or len(data) == 0:
-                            _LOGGER.warning(f"No data returned from API for station {self.station_name} ({self.station_code})")
-                            # Return last known good data if available
-                            if self.data:
-                                return self.data
-                            raise UpdateFailed("No data returned from API")
-                        
-                        # Extract the last value and scale appropriately
-                        last_value = data[-1]["value"]
-                        scaled_value = round(last_value / self.divisor, 3)
-                        
-                        return {
-                            "value": scaled_value,
-                            "raw_value": last_value,
-                            "timestamp": data[-1]["date"],
-                            "station_code": self.station_code,
-                            "stamp": self.stamp,
-                            "divisor": self.divisor,
-                        }
-                except aiohttp.ClientError as client_err:
-                    _LOGGER.error(f"Client error for {self.station_name}: {client_err}")
+                            raise UpdateFailed(f"Connection error: {client_err}")
+                        _LOGGER.warning(f"Retry {retry_count}/{max_retries} after client error")
+                        await asyncio.sleep(2)  # Wait before retrying
+                        continue
+            
+            except Exception as err:
+                _LOGGER.exception(f"Error updating radiation data for {self.station_name}: {err}")
+                # Try again if we have retries left
+                retry_count += 1
+                if retry_count >= max_retries:
+                    # Return last known good data if available
                     if self.data:
                         return self.data
-                    raise UpdateFailed(f"Connection error: {client_err}")
-        
-        except Exception as err:
-            _LOGGER.exception(f"Error updating radiation data for {self.station_name}: {err}")
-            # Return last known good data if available
-            if self.data:
-                return self.data
-            raise UpdateFailed(f"Error communicating with API: {err}")
+                    raise UpdateFailed(f"Error communicating with API: {err}")
+                _LOGGER.warning(f"Retry {retry_count}/{max_retries} after error: {err}")
+                await asyncio.sleep(2)  # Wait before retrying
+            
+            # If we got here without exceptions, break the retry loop
+            break
