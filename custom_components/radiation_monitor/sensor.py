@@ -80,13 +80,20 @@ class RadiationSensor(CoordinatorEntity, SensorEntity):
         if not self.coordinator.data:
             return {}
             
-        return {
+        attrs = {
             ATTR_TIMESTAMP: self.coordinator.data["timestamp"],
             ATTR_STATION_CODE: self.coordinator.data["station_code"],
             ATTR_RAW_VALUE: self.coordinator.data["raw_value"],
             ATTR_STAMP: self.coordinator.data["stamp"],
             ATTR_DIVISOR: self.coordinator.data["divisor"],
         }
+        
+        # Add any additional attributes that might be in the data
+        for key in ["returned_code", "status"]:
+            if key in self.coordinator.data:
+                attrs[key] = self.coordinator.data[key]
+        
+        return attrs
     
     @property
     def icon(self):
