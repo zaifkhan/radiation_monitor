@@ -1,24 +1,29 @@
 """The Radiation Monitor integration."""
 import asyncio
+import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import random
 
+import aiohttp
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
 import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
+    API_BASE_URL,
     CONF_STATION_CODE,
     CONF_STATION_NAME,
     CONF_SCAN_INTERVAL,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
     PLATFORMS,
+    STALE_AFTER_SECONDS,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -99,7 +104,10 @@ class RadiationUpdateCoordinator(DataUpdateCoordinator):
         self.station_name = station_name
         self.stamp = stamp
         self.divisor = divisor
-        
+        # Last outcome of a poll, used so we only log a problem once per
+        # state change instead of on every scan interval.
+        self._last_status: str | None = None
+
         super().__init__(
             hass,
             _LOGGER,
@@ -107,135 +115,231 @@ class RadiationUpdateCoordinator(DataUpdateCoordinator):
             update_interval=timedelta(seconds=scan_interval),
         )
     
+    def _record_status(self, status: str, message: str, level: int) -> None:
+        """Record the outcome of a poll and log it, only on state change.
+
+        A transition into a problem state (or between problem states) is logged
+        at the requested level; while the same condition persists it drops to
+        DEBUG so we don't spam the log. A return to "ok" emits a single INFO
+        recovery line.
+        """
+        if status == "ok":
+            if self._last_status not in (None, "ok"):
+                _LOGGER.info(
+                    "Radiation Monitor: station %s (%s) recovered — fresh data received again",
+                    self.station_name,
+                    self.station_code,
+                )
+            else:
+                _LOGGER.debug(message)
+        elif status == self._last_status:
+            # Same problem as last time: keep it at DEBUG.
+            _LOGGER.debug(message)
+        else:
+            _LOGGER.log(level, message)
+        self._last_status = status
+
+    def _fail(self, status: str, message: str, level: int):
+        """Handle a failed poll: log on state change, then degrade or raise.
+
+        If a last-known value exists we keep returning it (flagged with the
+        failure status and ``is_stale``) so the entity doesn't flap. With no
+        usable cache we raise ``UpdateFailed`` so HA marks the entity
+        unavailable and the outage is visible in the UI as well as the log.
+        """
+        self._record_status(status, message, level)
+        if self.data:
+            degraded = dict(self.data)
+            degraded["status"] = status
+            degraded["is_stale"] = True
+            return degraded
+        raise UpdateFailed(message)
+
+    def _parse_reading_datetime(self, value):
+        """Best-effort parse of an API reading timestamp to an aware UTC datetime.
+
+        Returns None if the value is missing or unparseable so the caller can
+        skip the staleness check rather than crash.
+        """
+        if not isinstance(value, str) or not value.strip():
+            return None
+        text = value.strip()
+        # Try ISO 8601 first (accepting a trailing "Z").
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+        # Fall back to the compact API timestamp format (assumed UTC).
+        try:
+            return datetime.strptime(text, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+
     async def _async_update_data(self):
         """Fetch data from API endpoint."""
+        session = async_get_clientsession(self.hass)
+
+        # Get current time and 72 hours ago in UTC (3 day window)
+        now_utc = datetime.now(timezone.utc)
+        start_utc = now_utc - timedelta(hours=72)
+
+        # Format timestamps for API call (format must stay %Y%m%d%H%M%S)
+        now_utc_str = now_utc.strftime("%Y%m%d%H%M%S")
+        start_utc_str = start_utc.strftime("%Y%m%d%H%M%S")
+
+        # Build URL from the single-source base URL in const.py
+        url = f"{API_BASE_URL}/timeseries/{start_utc_str}/{now_utc_str}?codes={self.station_code}"
+
+        # Prepare headers with our stamp
+        headers = {"stamp": str(self.stamp)}
+
         max_retries = 3
-        retry_count = 0
-        
-        while retry_count < max_retries:
+        last_client_error = None
+
+        for attempt in range(1, max_retries + 1):
             try:
-                # Get current time and 72 hours ago in UTC
-                now_utc = datetime.utcnow()
-                start_utc = now_utc - timedelta(hours=72)  # Extended to 3 days
-                
-                # Format timestamps for API call
-                now_utc_str = now_utc.strftime("%Y%m%d%H%M%S")
-                start_utc_str = start_utc.strftime("%Y%m%d%H%M%S")
-                
-                # Build URL
-                url = f"https://remap.jrc.ec.europa.eu/api/timeseries/v1/stations/timeseries/{start_utc_str}/{now_utc_str}?codes={self.station_code}"
-                
-                # Prepare headers with our stamp
-                headers = {"stamp": str(self.stamp)}
-                
-                # Fetch data
-                import aiohttp
-                async with aiohttp.ClientSession() as session:
+                # HA owns the shared session's lifecycle — do not use `async with`.
+                async with session.get(
+                    url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)
+                ) as response:
+                    response_text = await response.text()
+                    _LOGGER.debug(
+                        "Raw response text (first 500 chars): %s", response_text[:500]
+                    )
+
+                    # HTTP error from the API
+                    if response.status != 200:
+                        return self._fail(
+                            "http_error",
+                            "Radiation Monitor: station %s (%s) returned HTTP status %s"
+                            % (self.station_name, self.station_code, response.status),
+                            logging.WARNING,
+                        )
+
+                    # Parse the response as JSON (with a Latin-1 fallback)
                     try:
-                        async with session.get(url, headers=headers, timeout=30) as response:
-                            # Log raw response for debugging
-                            response_text = await response.text()
-                            _LOGGER.debug(f"Raw response text (first 500 chars): {response_text[:500]}")
-                            
-                            if response.status != 200:
-                                _LOGGER.warning(f"API returned status {response.status} for station {self.station_name} ({self.station_code})")
-                                # Return last known good data if available
-                                if self.data:
-                                    return self.data
-                                raise UpdateFailed(f"Error fetching data: {response.status}")
-                            
-                            # Parse the response as JSON
-                            try:
-                                # We already have the response text, so parse it directly
-                                import json
-                                try:
-                                    data = json.loads(response_text)
-                                except json.JSONDecodeError:
-                                    # Try again with explicit encoding
-                                    _LOGGER.debug("Trying alternative encoding for JSON parsing")
-                                    try:
-                                        # Try Latin-1 encoding which is more permissive
-                                        content_bytes = response_text.encode('utf-8')
-                                        data = json.loads(content_bytes.decode('latin-1'))
-                                    except Exception as enc_err:
-                                        _LOGGER.error(f"Failed encoding attempt: {enc_err}")
-                                        raise
-                            except Exception as json_err:
-                                _LOGGER.error(f"Error parsing JSON response: {json_err}")
-                                if self.data:
-                                    return self.data
-                                raise UpdateFailed(f"Error parsing response: {json_err}")
-                            
-                            # Debug the returned data
-                            if data and len(data) >= 2:
-                                _LOGGER.debug(f"Received data: {data[:2]}")  # Log first 2 items to avoid log spam
-                            elif data:
-                                _LOGGER.debug(f"Received data: {data}")  # Log all items if fewer than 2
-                            
-                            if not data or len(data) == 0:
-                                _LOGGER.warning(f"No data returned from API for station {self.station_name} ({self.station_code})")
-                                # Return last known good data if available
-                                if self.data:
-                                    return self.data
-                                
-                                # Instead of raising an error, return a default value
-                                return {
-                                    "value": 0,
-                                    "raw_value": 0,
-                                    "timestamp": datetime.utcnow().isoformat(),
-                                    "station_code": self.station_code,
-                                    "returned_code": "unknown",
-                                    "stamp": self.stamp,
-                                    "divisor": self.divisor,
-                                    "status": "No data available"
-                                }
-                            
-                            # Extract the last value - don't check station code since it might be encoded differently
-                            last_entry = data[-1]
-                            
-                            # Safely access properties
-                            try:
-                                last_value = last_entry["value"]
-                                scaled_value = round(last_value / self.divisor, 3)
-                                
-                                return {
-                                    "value": scaled_value,
-                                    "raw_value": last_value,
-                                    "timestamp": last_entry.get("date", datetime.utcnow().isoformat()),
-                                    "station_code": self.station_code,  # Use our stored station code
-                                    "returned_code": last_entry.get("code", "unknown"),  # Store the returned code for debugging
-                                    "stamp": self.stamp,
-                                    "divisor": self.divisor,
-                                }
-                            except KeyError as key_err:
-                                _LOGGER.error(f"Missing required key in data: {key_err}")
-                                if self.data:
-                                    return self.data
-                                raise UpdateFailed(f"Invalid data format: {key_err}")
-                                
-                    except aiohttp.ClientError as client_err:
-                        _LOGGER.error(f"Client error for {self.station_name}: {client_err}")
-                        # Try again if we have retries left
-                        retry_count += 1
-                        if retry_count >= max_retries:
-                            if self.data:
-                                return self.data
-                            raise UpdateFailed(f"Connection error: {client_err}")
-                        _LOGGER.warning(f"Retry {retry_count}/{max_retries} after client error")
-                        await asyncio.sleep(2)  # Wait before retrying
-                        continue
-            
-            except Exception as err:
-                _LOGGER.exception(f"Error updating radiation data for {self.station_name}: {err}")
-                # Try again if we have retries left
-                retry_count += 1
-                if retry_count >= max_retries:
-                    # Return last known good data if available
-                    if self.data:
-                        return self.data
-                    raise UpdateFailed(f"Error communicating with API: {err}")
-                _LOGGER.warning(f"Retry {retry_count}/{max_retries} after error: {err}")
-                await asyncio.sleep(2)  # Wait before retrying
-            
-            # If we got here without exceptions, break the retry loop
-            break
+                        data = json.loads(response_text)
+                    except json.JSONDecodeError:
+                        _LOGGER.debug("Trying alternative encoding for JSON parsing")
+                        try:
+                            data = json.loads(
+                                response_text.encode("utf-8").decode("latin-1")
+                            )
+                        except Exception as enc_err:
+                            return self._fail(
+                                "bad_data",
+                                "Radiation Monitor: station %s (%s) sent an unparseable "
+                                "payload: %s"
+                                % (self.station_name, self.station_code, enc_err),
+                                logging.ERROR,
+                            )
+
+                    # Empty response / station not in payload → offline
+                    if not data:
+                        return self._fail(
+                            "offline",
+                            "Radiation Monitor: station %s (%s) returned no data — "
+                            "treating as offline / not reporting"
+                            % (self.station_name, self.station_code),
+                            logging.WARNING,
+                        )
+
+                    if len(data) >= 2:
+                        _LOGGER.debug("Received data: %s", data[:2])
+                    else:
+                        _LOGGER.debug("Received data: %s", data)
+
+                    # Extract the newest reading
+                    last_entry = data[-1]
+                    try:
+                        last_value = last_entry["value"]
+                    except (KeyError, TypeError) as key_err:
+                        return self._fail(
+                            "bad_data",
+                            "Radiation Monitor: station %s (%s) sent malformed data, "
+                            "missing 'value': %s"
+                            % (self.station_name, self.station_code, key_err),
+                            logging.ERROR,
+                        )
+
+                    scaled_value = round(last_value / self.divisor, 3)
+                    timestamp = last_entry.get("date", now_utc.isoformat())
+
+                    # Freshness / staleness check
+                    reading_dt = self._parse_reading_datetime(last_entry.get("date"))
+                    if reading_dt is None:
+                        _LOGGER.debug(
+                            "Radiation Monitor: station %s (%s) has missing/unparseable "
+                            "reading date %r — skipping staleness check",
+                            self.station_name,
+                            self.station_code,
+                            last_entry.get("date"),
+                        )
+                    elif (now_utc - reading_dt).total_seconds() > STALE_AFTER_SECONDS:
+                        # Degraded: keep the last-known value but flag it as stale.
+                        self._record_status(
+                            "stale",
+                            "Radiation Monitor: station %s (%s) newest reading is older "
+                            "than %s s — treating as stale"
+                            % (
+                                self.station_name,
+                                self.station_code,
+                                STALE_AFTER_SECONDS,
+                            ),
+                            logging.WARNING,
+                        )
+                        return {
+                            "value": scaled_value,
+                            "raw_value": last_value,
+                            "timestamp": timestamp,
+                            "station_code": self.station_code,
+                            "returned_code": last_entry.get("code", "unknown"),
+                            "stamp": self.stamp,
+                            "divisor": self.divisor,
+                            "status": "stale",
+                            "is_stale": True,
+                        }
+
+                    # Fresh, valid data — success (also logs recovery if needed)
+                    self._record_status(
+                        "ok",
+                        "Radiation Monitor: station %s (%s) updated successfully"
+                        % (self.station_name, self.station_code),
+                        logging.DEBUG,
+                    )
+                    return {
+                        "value": scaled_value,
+                        "raw_value": last_value,
+                        "timestamp": timestamp,
+                        "station_code": self.station_code,
+                        "returned_code": last_entry.get("code", "unknown"),
+                        "stamp": self.stamp,
+                        "divisor": self.divisor,
+                        "status": "online",
+                        "is_stale": False,
+                    }
+
+            except (aiohttp.ClientError, asyncio.TimeoutError) as client_err:
+                # Network/DNS/timeout — retry, then classify as unreachable.
+                last_client_error = client_err
+                if attempt < max_retries:
+                    _LOGGER.debug(
+                        "Radiation Monitor: station %s (%s) fetch attempt %s/%s failed: "
+                        "%s — retrying",
+                        self.station_name,
+                        self.station_code,
+                        attempt,
+                        max_retries,
+                        client_err,
+                    )
+                    await asyncio.sleep(2)
+                    continue
+
+        # Retries exhausted without a successful response → unreachable
+        return self._fail(
+            "unreachable",
+            "Radiation Monitor: station %s (%s) unreachable after %s attempts: %s"
+            % (self.station_name, self.station_code, max_retries, last_client_error),
+            logging.ERROR,
+        )

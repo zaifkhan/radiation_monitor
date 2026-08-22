@@ -7,6 +7,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import aiohttp_client
 
 from .const import (
+    API_BASE_URL,
     DOMAIN,
     CONF_STATION_CODE,
     CONF_STATION_NAME,
@@ -69,19 +70,19 @@ class RadiationMonitorConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     
     async def _test_station_code(self, station_code):
         """Test if the station code is valid by making an API call."""
-        from datetime import datetime, timedelta
+        from datetime import datetime, timedelta, timezone
         import random
-        
+
         # Get current time and 1 hour ago in UTC
-        now_utc = datetime.utcnow()
+        now_utc = datetime.now(timezone.utc)
         start_utc = now_utc - timedelta(hours=1)
-        
+
         # Format timestamps for API call
         now_utc_str = now_utc.strftime("%Y%m%d%H%M%S")
         start_utc_str = start_utc.strftime("%Y%m%d%H%M%S")
-        
+
         # Build URL
-        url = f"https://remap.jrc.ec.europa.eu/api/timeseries/v1/stations/timeseries/{start_utc_str}/{now_utc_str}?codes={station_code}"
+        url = f"{API_BASE_URL}/timeseries/{start_utc_str}/{now_utc_str}?codes={station_code}"
         
         # Generate a random stamp for validation
         stamp = random.randint(20, 999)

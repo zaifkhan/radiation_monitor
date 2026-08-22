@@ -89,7 +89,7 @@ class RadiationSensor(CoordinatorEntity, SensorEntity):
         }
         
         # Add any additional attributes that might be in the data
-        for key in ["returned_code", "status"]:
+        for key in ["returned_code", "status", "is_stale"]:
             if key in self.coordinator.data:
                 attrs[key] = self.coordinator.data[key]
         

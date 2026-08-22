@@ -10,6 +10,13 @@ CONF_SCAN_INTERVAL = "scan_interval"
 # Default values
 DEFAULT_SCAN_INTERVAL = 3600  # 60 minutes
 
+# Base URL for the JRC REMap timeseries API.
+# Full path: {API_BASE_URL}/timeseries/{start}/{now}?codes={code}
+API_BASE_URL = "https://remap.jrc.ec.europa.eu/mapSvc/api/timeseries/v1/stations"
+
+# If the newest reading is older than this, treat the station as offline/stale.
+STALE_AFTER_SECONDS = 3 * DEFAULT_SCAN_INTERVAL
+
 # Platform definitions
 PLATFORMS = ["sensor"]
 

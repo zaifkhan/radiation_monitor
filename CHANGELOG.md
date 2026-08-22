@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.2.0 (2026-08-23)
+
+### Changed
+- Updated the JRC REMap API base URL to the new `/mapSvc` path (the old endpoint no longer works). The base URL now lives in a single `API_BASE_URL` constant in `const.py`.
+- Switched to Home Assistant's shared aiohttp session instead of creating a new session on every poll.
+- Replaced the deprecated `datetime.utcnow()` with `datetime.now(timezone.utc)` (API timestamp format unchanged).
+
+### Added
+- Clear Home Assistant logging for offline, stale, unreachable, HTTP-error, and malformed-data conditions, each naming the affected station. Messages are logged on state change (repeats drop to DEBUG) to avoid log spam, with a single INFO recovery line when a station comes back.
+- Entities now go `unavailable` on hard failure (no fresh data and no usable cached value) via `UpdateFailed`.
+- New `status` and `is_stale` attributes so degraded/stale conditions are visible in the entity state, not just the logs.
+
 ## v1.1.0 (2025-04-06)
 
 ### Fixed
